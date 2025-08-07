@@ -16564,6 +16564,9 @@ impl Editor {
                 self.selections.disjoint_anchors()
             });
 
+        // Store selections before any formatting operations for cursor preservation during whitespace operations
+        let selections_before_format = self.selections.disjoint_anchors();
+
         let mut timeout = cx.background_executor().timer(FORMAT_TIMEOUT).fuse();
         let format = project.update(cx, |project, cx| {
             project.format(buffers, target, true, trigger, cx)
@@ -16594,7 +16597,17 @@ impl Editor {
             {
                 let has_new_transaction = transaction_id_prev != Some(transaction_id_now);
                 if has_new_transaction {
-                    _ = editor.update(cx, |editor, _| {
+                    _ = editor.update_in(cx, |editor, window, cx| {
+                        // For save operations, preserve cursor positions that may have been
+                        // affected by whitespace operations (trailing whitespace removal and final newline)
+                        if trigger == FormatTrigger::Save {
+                            editor.restore_cursor_positions_after_whitespace_operations(
+                                &selections_before_format,
+                                window,
+                                cx
+                            );
+                        }
+                        
                         editor
                             .selection_history
                             .insert_transaction(transaction_id_now, selections_prev);
@@ -16604,6 +16617,80 @@ impl Editor {
 
             Ok(())
         })
+    }
+
+    /// Restore cursor positions after whitespace operations during save.
+    /// This prevents cursors from jumping to newly inserted final newlines.
+    fn restore_cursor_positions_after_whitespace_operations(
+        &mut self,
+        original_selections: &[Selection<Anchor>],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let buffer = self.buffer.read(cx);
+        let current_snapshot = buffer.snapshot(cx);
+        
+        // Find selections that were at the end of the file before whitespace operations
+        let mut selections_to_restore = Vec::new();
+        let mut needs_adjustment = false;
+        
+        for selection in original_selections {
+            // Convert original anchors to offsets in the current snapshot
+            let head_offset = selection.head().to_offset(&current_snapshot);
+            let tail_offset = selection.tail().to_offset(&current_snapshot);
+            
+            // Check if the selection appears to be at the very end (after potential newline insertion)
+            let current_len = current_snapshot.len();
+            let text = current_snapshot.text();
+            
+            // Find the position after the last non-whitespace character in current content
+            let mut last_content_offset = current_len;
+            for (offset, ch) in text.char_indices().rev() {
+                if !ch.is_ascii_whitespace() {
+                    last_content_offset = offset + ch.len_utf8();
+                    break;
+                }
+            }
+            
+            // If cursor is at the very end and there's trailing whitespace/newlines, 
+            // move it to after the last content character
+            let head_at_end = head_offset >= last_content_offset;
+            let tail_at_end = tail_offset >= last_content_offset;
+            
+            if head_at_end || tail_at_end {
+                needs_adjustment = true;
+                
+                // Create new selection with cursor positioned after last content
+                let new_head = if head_at_end {
+                    current_snapshot.anchor_after(last_content_offset)
+                } else {
+                    selection.head()
+                };
+                
+                let new_tail = if tail_at_end {
+                    current_snapshot.anchor_after(last_content_offset)
+                } else {
+                    selection.tail()
+                };
+                
+                selections_to_restore.push(Selection {
+                    id: selection.id,
+                    start: new_tail,
+                    end: new_head,
+                    reversed: selection.reversed,
+                    goal: selection.goal,
+                });
+            } else {
+                selections_to_restore.push(selection.clone());
+            }
+        }
+        
+        // Only apply changes if adjustments are needed
+        if needs_adjustment {
+            self.change_selections(SelectionEffects::default(), window, cx, |selections| {
+                selections.select_anchors(selections_to_restore);
+            });
+        }
     }
 
     fn organize_imports(

@@ -24071,6 +24071,76 @@ async fn test_newline_replacement_in_single_line(cx: &mut TestAppContext) {
     });
 }
 
+#[gpui::test]
+async fn test_cursor_position_preserved_during_save_with_whitespace_operations(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |settings| {
+        settings.defaults.remove_trailing_whitespace_on_save = Some(true);
+        settings.defaults.ensure_final_newline_on_save = Some(true);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_file(path!("/file.txt"), "hello world".into()).await;
+
+    let project = Project::test(fs, [path!("/file.txt").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/file.txt"), cx)
+        })
+        .await
+        .unwrap();
+
+    let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+    let (editor, cx) = cx.add_window_view(|window, cx| {
+        Editor::new(EditorMode::full(), buffer, Some(project.clone()), window, cx)
+    });
+    
+    // Position cursor at the very end of the file (after "world")
+    editor.update_in(cx, |editor, window, cx| {
+        let buffer_snapshot = editor.buffer().read(cx).snapshot(cx);
+        let end_position = buffer_snapshot.len();
+        editor.change_selections(SelectionEffects::default(), window, cx, |s| {
+            s.select_ranges([end_position..end_position]);
+        });
+    });
+
+    // Verify cursor is at the end
+    editor.read_with(cx, |editor, cx| {
+        let buffer = editor.buffer().read(cx).snapshot(cx);
+        let selection = editor.selections.newest_anchor();
+        assert_eq!(selection.head().to_offset(&buffer), 11); // After "hello world"
+    });
+
+    // Save the file (this will trigger whitespace operations)
+    let save_task = editor.update_in(cx, |editor, window, cx| {
+        editor.save(
+            SaveOptions {
+                format: true,
+                autosave: false,
+            },
+            project.clone(),
+            window,
+            cx,
+        )
+    });
+    save_task.await.unwrap();
+
+    // Verify cursor position is preserved at the logical position (after content, not at new newline)
+    editor.read_with(cx, |editor, cx| {
+        let buffer = editor.buffer().read(cx).snapshot(cx);
+        let selection = editor.selections.newest_anchor();
+        let cursor_offset = selection.head().to_offset(&buffer);
+        
+        // The cursor should be positioned after "hello world" (offset 11), not at the new final newline
+        assert_eq!(cursor_offset, 11, "Cursor should stay after the last content character");
+        
+        // Verify the file now ends with a newline
+        let text = buffer.text();
+        assert_eq!(text, "hello world\n", "File should have final newline added");
+    });
+}
+
 #[track_caller]
 fn extract_color_inlays(editor: &Editor, cx: &App) -> Vec<Rgba> {
     editor
